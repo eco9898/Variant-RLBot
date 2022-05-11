@@ -1,29 +1,28 @@
-import glob, sys, multiprocessing, pathlib
+import sys, multiprocessing, pathlib, os, pickle, torch, torch.jit, wandb
 from time import sleep, time
 from  datetime import datetime
 from typing import Dict
 import numpy as np
 from rlgym.envs import Match
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
-from stable_baselines3.common.vec_env import VecMonitor, VecNormalize, VecCheckNan
-from stable_baselines3.ppo import MlpPolicy
-
+from redis import Redis
+from torch.nn import Linear, Sequential, ReLU
+from rocket_learn.rollout_generator.redis_rollout_generator import RedisRolloutWorker
 from rlgym.utils.state_setters import RandomState
 from rlgym.utils.terminal_conditions.common_conditions import *
-from rlgym_tools.sb3_utils import SB3MultipleInstanceEnv
 from rlgym.utils.reward_functions.common_rewards.misc_rewards import *
 from rlgym.utils.reward_functions.common_rewards.player_ball_rewards import *
 from rlgym.utils.reward_functions.common_rewards.ball_goal_rewards import *
 from rlgym.utils.reward_functions.common_rewards.conditional_rewards import *
 from rlgym.utils.reward_functions import CombinedReward
-from rlgym_tools.sb3_utils.sb3_log_reward import * # line 21 = if len(returns) > 0: # my own fix
-
+from rocket_learn.agent.actor_critic_agent import ActorCriticAgent
+from rocket_learn.agent.discrete_policy import DiscretePolicy
+from rocket_learn.ppo import PPO
+from rocket_learn.rollout_generator.redis_rollout_generator import RedisRolloutGenerator
+from rocket_learn.utils.util import SplitLayer
 
 parent_directory = str(pathlib.Path(__file__).parent.parent.resolve())
 sys.path.append(parent_directory)
 
-from utils.advanced_padder import AdvancedObsPadder
 from utils.discrete_act import DiscreteAction
 from utils.util_classes import *
 from utils.modified_states import *
@@ -33,7 +32,8 @@ WAIT_TIME_NO_PAGING = 20
 WAIT_TIME_PAGING = 35
 INSTANCE_SETUP_TIME = 50 #for safety
 
-total_num_instances = 10
+total_num_instances = 5
+run_learner = True
 kickoff_instances = total_num_instances // 3
 match_instances = total_num_instances - kickoff_instances
 models: List = [["kickoff", kickoff_instances], ["match", match_instances]]
@@ -41,6 +41,9 @@ models: List = [["match", total_num_instances]]
 #models: List = [["kickoff", total_num_instances]]
 
 data_location = parent_directory + "/data/"
+pickle_directory = parent_directory + "/trainer/"
+
+pickleData = pickle.load(open(pickle_directory + "pickleData.obj","rb"))
 
 paging = False
 if total_num_instances > MAX_INSTANCES_NO_PAGING:
@@ -49,11 +52,149 @@ wait_time=WAIT_TIME_NO_PAGING
 if paging:
     wait_time=WAIT_TIME_PAGING
 
-def start_training(send_messages: multiprocessing.Queue, model_args: List):
-    global paging, wait_time, total_num_instances
+def runWorker(match):
+    global pickleData
+    """
+    Starts up a rocket-learn worker process, which plays out a game, sends back game data to the 
+    learner, and receives updated model parameters when available
+    """    
+    # OPTIONAL ADDITION: LIMIT TORCH THREADS TO 1 ON THE WORKERS TO LIMIT TOTAL RESOURCE USAGE
+    torch.set_num_threads(1)
+
+    
+
+    # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
+    # CONFIG)
+    r = Redis(host="127.0.0.1", password=pickleData["REDIS"])
+    print("Redis init")
+
+
+    # LAUNCH ROCKET LEAGUE AND BEGIN TRAINING
+    # -past_version_prob SPECIFIES HOW OFTEN OLD VERSIONS WILL BE RANDOMLY SELECTED AND TRAINED AGAINST
+    RedisRolloutWorker(r, "Variant", match, 
+        past_version_prob=.2, 
+        evaluation_prob=0.01, 
+        sigma_target=1,
+        streamer_mode=False, 
+        send_gamestates=False, 
+        pretrained_agents=None, 
+        human_agent=None,
+        deterministic_old_prob=0.5).run()
+
+def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, save_dir, rewards):
+    global pickleData
+    print("Learner instance started")
+    """
+    
+    Starts up a rocket-learn learner process, which ingests incoming data, updates parameters
+    based on results, and sends updated model parameters out to the workers
+    
+    """
+
+    # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
+    # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
+    wandb.login(key=pickleData["WANDB_KEY"])
+    logger = wandb.init(project="Variant", entity=pickleData["ENTITY"])
+    logger.name = "Variant"
+    print("Wandb init")
+
+    # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
+    # CONFIG)
+    redis = Redis(password=pickleData["REDIS"])
+    print("Redis init")
+
+    # THE ROLLOUT GENERATOR CAPTURES INCOMING DATA THROUGH REDIS AND PASSES IT TO THE LEARNER.
+    # -save_every SPECIFIES HOW OFTEN OLD VERSIONS ARE SAVED TO REDIS. THESE ARE USED FOR TRUESKILL
+    # COMPARISON AND TRAINING AGAINST PREVIOUS VERSIONS
+    # -clear DELETE REDIS ENTRIES WHEN STARTING UP (SET TO FALSE TO CONTINUE WITH OLD AGENTS)
+    rollout_gen = RedisRolloutGenerator(redis, ExpandAdvancedObs, rewards, DiscreteAction,
+                                        logger=logger,
+                                        save_every=100,
+                                        clear=False)
+    print("Rollout init")
+
+    # ROCKET-LEARN EXPECTS A SET OF DISTRIBUTIONS FOR EACH ACTION FROM THE NETWORK, NOT
+    # THE ACTIONS THEMSELVES. SEE network_setup.readme.txt FOR MORE INFORMATION
+    split = (3, 3, 3, 3, 3, 2, 2, 2)
+    total_output = sum(split)
+
+    # TOTAL SIZE OF THE INPUT DATA
+    state_dim = 231
+
+    critic = Sequential(
+        Linear(state_dim, 256),
+        ReLU(),
+        Linear(256, 256),
+        ReLU(),
+        Linear(256, 1)
+    )
+
+    actor = DiscretePolicy(Sequential(
+        Linear(state_dim, 256),
+        ReLU(),
+        Linear(256, 256),
+        ReLU(),
+        Linear(256, total_output),
+        SplitLayer(splits=split)
+    ), split)
+
+    optim = torch.optim.Adam([
+        {"params": actor.parameters(), "lr": 5e-5},
+        {"params": critic.parameters(), "lr": 5e-5}
+    ])
+
+    # PPO REQUIRES AN ACTOR/CRITIC AGENT
+    agent = ActorCriticAgent(actor=actor, critic=critic, optimizer=optim)
+
+    alg = PPO(
+        rollout_gen,
+        agent,
+        ent_coef=0.01,
+        n_steps=steps,
+        batch_size=batch_size,
+        minibatch_size=batch_size / 2,
+        epochs=10,
+        gamma=gamma,
+        clip_range=0.2,
+        gae_lambda=0.95,
+        vf_coef=1,
+        max_grad_norm=0.5,
+        logger=logger,
+        device="cuda"
+    )
+
+    print("PPO init")
+    # BEGIN TRAINING. IT WILL CONTINUE UNTIL MANUALLY STOPPED
+    # -iterations_per_save SPECIFIES HOW OFTEN CHECKPOINTS ARE SAVED
+    # -save_dir SPECIFIES WHERE
+    send_messages.put(1)
+    alg.run(iterations_per_save=100, save_dir=save_dir)
+
+"""if __name__ == '__main__':
+    match = Match(
+            game_speed=100,
+            self_play=True,
+            team_size=1,
+            state_setter=DefaultState(),
+            obs_builder=ExpandAdvancedObs(),
+            action_parser=DiscreteAction(),
+            terminal_conditions=[TimeoutCondition(round(2000)),
+                                GoalScoredCondition()],
+            reward_function=JumpTouchReward()
+        )
+    learner = multiprocessing.Process(target=runLearner, args=[1000000, 1000000, np.exp(np.log(0.5) / (120 * 5)), data_location + "models/", JumpTouchReward])
+    learner.start()
+    sleep(20)
+
+    worker = multiprocessing.Process(target=runWorker, args=[match])
+    worker.start()
+
+    sleep(100)"""
+def startTraining(send_messages: multiprocessing.Queue, model_args: List):
+    global paging, wait_time, total_num_instances, run_learner
     name = model_args[0]
     num_instances = model_args[1]
-    frame_skip = 12          # Number of ticks to repeat an action
+    frame_skip = 8          # Number of ticks to repeat an action
     half_life_seconds = 5   # Easier to conceptualize, after this many seconds the reward discount is 0.5
 
     reward_log_file = data_location + "logs/" + name + "/reward_" + str(datetime.now().hour) + "-" + str(datetime.now().minute)
@@ -83,8 +224,7 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
     print(">>>Training interval:", training_interval)
     mmr_save_frequency = 50_000_000
     print(">>>MMR frequency:    ", mmr_save_frequency)
-    send_messages.put(1)
-    attackRewards = SB3CombinedLogReward(
+    attackRewards = CombinedReward(
         (
             VelocityPlayerToBallReward(),
             LiuDistancePlayerToBallReward(),
@@ -92,10 +232,9 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
             RewardIfTouchedLast(VelocityBallToGoalReward()),
             RewardIfClosestToBall(AlignBallGoal(0,1), True),
         ),
-        (2.0, 0.2, 1.0, 1.0, 0.8),
-        reward_log_file + "_attack")
+        (2.0, 0.2, 1.0, 1.0, 0.8))
 
-    defendRewards = SB3CombinedLogReward(
+    defendRewards = CombinedReward(
         (
             VelocityPlayerToBallReward(),
             LiuDistancePlayerToBallReward(),
@@ -103,20 +242,18 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
             RewardIfTouchedLast(VelocityBallToGoalReward()),
             AlignBallGoal(1,0)
         ),
-        (1.0, 0.2, 1.0, 1.0, 1.5),
-        reward_log_file + "_defend")
+        (1.0, 0.2, 1.0, 1.0, 1.5))
 
-    lastManRewards = SB3CombinedLogReward(
+    lastManRewards = CombinedReward(
         (
             RewardIfTouchedLast(VelocityBallToGoalReward()),
             AlignBallGoal(1,0),
             LiuDistancePlayerToGoalReward(),
             ConstantReward()
         ),
-        (2.0, 1.0, 0.6, 0.2),
-        reward_log_file + "_last_man")
+        (2.0, 1.0, 0.6, 0.2))
 
-    kickoffRewards = SB3CombinedLogReward(
+    kickoffRewards = CombinedReward(
         (
             RewardIfClosestToBall(
                 CombinedReward(
@@ -136,67 +273,24 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
             TeamSpacingReward(),
             pickupBoost()
         ),
-        (2.0, 1.0, 1.5, 1.0, 0.4),
-        reward_log_file + "_kickoff")
-
-    def exit_save(model, name: str):
-        model.save(data_location + "models/" + name + "/exit_save")
-
-    def load_save(name: str, env, steps, batch_size, MlpPolicy, gamma):
-        try:
-            folder_path = data_location + 'models/' + name
-            file_type = r'\*.zip'
-            files = glob.glob(folder_path + file_type)
-            newest_kickoff_model = max(files, key=os.path.getctime)[0:-4]
-            model = PPO.load(
-                newest_kickoff_model,
-                env,
-                device="auto",
-                #custom_objects={"n_envs": env.num_envs}, #automatically adjusts to users changing instance count, may encounter shaping error otherwise
-                #If you need to adjust parameters mid training, you can use the below example as a guide
-                custom_objects={"n_envs": env.num_envs, "n_steps": steps, "batch_size": batch_size, "_last_obs": None, "tensorboard_log": data_location + "logs/" + name}
-            )
-            print(">>>Loaded previous exit save.")
-            return model
-        except:
-            print(">>>No saved model found, creating new model.")
-            from torch.nn import Tanh
-            policy_kwargs = dict(
-                activation_fn=Tanh,
-                net_arch=[512, 512, dict(pi=[256, 256, 256], vf=[256, 256, 256])],
-            )
-
-            return PPO(
-                MlpPolicy,
-                env,
-                n_epochs=10,                 # PPO calls for multiple epochs
-                policy_kwargs=policy_kwargs,
-                learning_rate=5e-5,          # Around this is fairly common for PPO
-                ent_coef=0.01,               # From PPO Atari
-                vf_coef=1.,                  # From PPO Atari
-                gamma=gamma,                 # Gamma as calculated using half-life
-                verbose=3,                   # Print out all the info as we're going
-                batch_size=batch_size,             # Batch size as high as possible within reason
-                n_steps=steps,                # Number of steps to perform before optimizing network
-                tensorboard_log=data_location + "/logs/" + name,  # `tensorboard --logdir out/logs` in terminal to see graphs
-                device="auto"                # Uses GPU if available
-            )
+        (2.0, 1.0, 1.5, 1.0, 0.4))
 
     def get_base_match():  # Need to use a function so that each instance can call it and produce their own objects
         return Match(
             team_size=team_size, #amount of bots per team
             tick_skip=frame_skip,
+            game_speed=100,
             self_play=self_play, #play against its self
-            obs_builder=AdvancedObsPadder(3),  # Not that advanced, good default
+            obs_builder=ExpandAdvancedObs(3),  # Not that advanced, good default
             action_parser=DiscreteAction(),  # Discrete > Continuous don't @ me
             reward_function= CombinedReward((), ()),
-            terminal_conditions = [TimeoutCondition(fps * 300), NoTouchTimeoutCondition(fps * 45), GoalScoredCondition()],
+            terminal_conditions = [TimeoutCondition(fps * 300), NoTouchTimeoutCondition(fps * 120), GoalScoredCondition()],
             state_setter = RandomState()  # Resets to random
         )
 
-    def get_match():  # Need to use a function so that each instance can call it and produce their own objects
+    def get_match():
         match: Match = get_base_match()
-        match._reward_fn = SB3CombinedLogReward(
+        match._reward_fn = CombinedReward(
             (
                 RewardIfAttacking(attackRewards),
                 RewardIfDefending(defendRewards),
@@ -219,18 +313,14 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
                 pickupBoost(),
                 useBoost()
             ),
-            #(1.0, 0.2, 0.5, 1.0, 1.0, 1.0, 1.5, 1.0, 5.0, 0.6, 0.2, 1.6, 10.0),
-            #(0.17, 0.20, 0.15, 0.24, 0.14, 3.92, 54.70, 6.07, 0.37, 0.19, 0.12, 0.60, 37.27), checkpoint 1
-            #(0.17, 0.20, 0.15, 0.24, 0.14, 3.92, 54.70, 6.07, 0.37, 0.19, 0.12, 0.60, 37.27),
-            (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35),
-            reward_log_file)
-        match._terminal_conditions = [TimeoutCondition(fps * 300), NoTouchTimeoutCondition(fps * 45), GoalScoredCondition()]
+            (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
+        match._terminal_conditions = [TimeoutCondition(fps * 300), NoTouchTimeoutCondition(fps * 120), GoalScoredCondition()]
         match._state_setter = RandomState()  # Resets to random
         return match
 
-    def get_kickoff():  # Need to use a function so that each instance can call it and produce their own objects
+    def get_kickoff():
         match: Match = get_base_match()
-        match._reward_fn = SB3CombinedLogReward(
+        match._reward_fn = CombinedReward(
             (
                 kickoffRewards,
                 VelocityReward(),
@@ -251,8 +341,7 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
                 pickupBoost(),
                 useBoost(),
             ),
-            (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16),
-            reward_log_file)
+            (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16))
         #time out after 12 seconds encourage kickoff
         match._terminal_conditions = [TimeoutCondition(fps * 12), GoalScoredCondition()]
         match._state_setter = ModifiedState()  # Resets to kickoff position
@@ -262,74 +351,45 @@ def start_training(send_messages: multiprocessing.Queue, model_args: List):
         match = get_kickoff
     else:
         match = get_match
-    env = SB3MultipleInstanceEnv(match, model_args[1], force_paging=paging, wait_time=wait_time) #or 40            # Start instances, waiting 60 seconds between each
-    env = VecCheckNan(env)                                # Optional
-    env = VecMonitor(env)                                 # Recommended, logs mean reward and ep_len to Tensorboard
-    env = VecNormalize(env, norm_obs=False, gamma=gamma)  # Highly recommended, normalizes rewards
-
-    model = load_save(model_args[0], env, steps, batch_size, MlpPolicy, gamma)
-
-    # Save model every so often
-    # Divide by num_envs (number of agents) because callback only increments every time all agents have taken a step
-    # This saves to specified folder with a specified name
-    checkpoint_callback = CheckpointCallback(round(1_000_000*(num_instances/total_num_instances) / env.num_envs), save_path=data_location + "models/" + name, name_prefix="rl_model") # backup every 5 mins
-    
-    rewardList = [checkpoint_callback]
-
-    attack_names = ["AttVel", 'AttDisToBall', "AttBallToGoalDis", "AttBallToGoalVel", "AttAlignGoalOff"]
-    defend_names = ["DefVel", 'DefDisToBall', "DefBallToGoalDis", "DefBallToGoalVel", "DefAlignGoalDef"]
-    last_man_names = ["LMBallToGoalVel", "LMAlignGoalDef", "LMDisToGoal", 'LMConstant']
-    kickoff_names = ["KOCombination", "KODef", "KOLastman", "KOSpacing", "KOPickupBoost"]
-    reward_graph_callback_attacks = SB3CombinedLogRewardCallback(
-        attack_names,
-        reward_log_file + "_attack")
-    reward_graph_callback_defend = SB3CombinedLogRewardCallback(
-        defend_names,
-        reward_log_file + "_defend")
-    reward_graph_callback_last_man = SB3CombinedLogRewardCallback(
-        last_man_names,
-        reward_log_file + "_last_man")
-    reward_graph_callback_kickoff = SB3CombinedLogRewardCallback(
-        kickoff_names,
-        reward_log_file + "_kickoff")
-    if name == "kickoff":
-        reward_names = ["KickKickoff", "KickVel", 'KickFaceball', "KickEvent", "KickJumptouch", "KickTouch", "KickSpacing", "KickFlip", "KickSaveboost", "KickPickupboost", "KickUseboost"]
+    if run_learner:
+        print(">>>Starting learner")
+        receive_messages = multiprocessing.Queue()
+        learner = multiprocessing.Process(target=runLearner, args=[receive_messages, steps, batch_size, gamma, data_location + "models/" + name, match()._reward_fn])
+        learner.start()
+        #Give it time to start
+        while receive_messages.qsize() == 0:
+            sleep(15)
+        receive_messages.get()
     else:
-        reward_names = ["MatchAtt", "MatchDef", "MatchLastman", "MatchVel", 'MatchFaceball', "MatchEvent", "MatchJumptouch", "MatchTouch", "MatchSpacing", "MatchFlip", "MatchSaveboost", "MatchPickupboost", "MatchUseboost"]
-    reward_graph_callback = SB3CombinedLogRewardCallback(
-        reward_names,
-        reward_log_file)
-    if name == "kickoff":
-        rewardList.extend([reward_graph_callback, reward_graph_callback_kickoff])
-    else:
-        rewardList.extend([reward_graph_callback, reward_graph_callback_attacks, reward_graph_callback_defend, reward_graph_callback_last_man])
-    #1mill per 8/9 minutes at 5 instances?
-
-    mmr_model_target_count = model.num_timesteps + (mmr_save_frequency - (model.num_timesteps % mmr_save_frequency)) #current steps + remaing steps until mmr model
-    closed_messages = False
+        print(">>>Skipping learner")
+    send_messages.put(1)
+    workers: List[multiprocessing.Process]= []
+    for i in range(num_instances):
+        print(">>>Starting worker:", i)
+        worker = multiprocessing.Process(target=runWorker, args=[match()])
+        worker.start()
+        workers.append(worker)
+        sleep(wait_time)
+    send_messages.put(2)
+    send_messages.close()
     try:
         while True:
-            new_training_interval = training_interval - (model.num_timesteps % training_interval) # remaining steps to train interval
-            print(">>>Training for %s timesteps" % new_training_interval)
-            if not closed_messages:
-                send_messages.put(2)
-                send_messages.close()
-                closed_messages = True
-            #may need to reset timesteps when you're running a different number of instances than when you saved the model
-            #subprocess learning
-            model.learn(new_training_interval, callback=CallbackList(rewardList), reset_num_timesteps=False) #can ignore callback if training_interval < callback target
-            exit_save(model, name)
-            if model.num_timesteps >= mmr_model_target_count:
-                model.save(f"{data_location}mmr_models/{model_args[0]}/{model.num_timesteps}")
-                mmr_model_target_count += mmr_save_frequency
-
+            for worker in workers:
+                if worker.is_alive():
+                    sleep(1)
+                else:
+                    print(">>>Restarting worker")
+                    worker = multiprocessing.Process(target=runWorker, args=[match()])
+                    worker.start()
+                    sleep(wait_time)
     except KeyboardInterrupt:
-        print(">>>Exiting training")
-    if not closed_messages:
-        send_messages.close()
-    print(">>>Saving model")
-    exit_save(model, name)
-    print(">>>Save complete")
+        #Wait for workers to die
+        for worker in workers:
+            while worker.is_alive():
+                sleep(0.1)
+        #Wait for learner to die
+        while learner.is_alive():
+            sleep(0.1)
 
 def trainingMonitor(send_messages: multiprocessing.Queue, model_args):
     global wait_time, paging
@@ -339,13 +399,15 @@ def trainingMonitor(send_messages: multiprocessing.Queue, model_args):
     initial_RLPIDs = getRLInstances()
     print(">>Initial instances:", len(initial_RLPIDs))
     receive_messages = multiprocessing.Queue()
-    trainer = multiprocessing.Process(target=start_training, args=[receive_messages, model_args])
+    trainer = multiprocessing.Process(target=startTraining, args=[receive_messages, model_args])
     trainer.start()
     try:
         count = 0
         #Wait until setup is printed
         while receive_messages.empty() and trainer.is_alive():
             sleep(1)
+        if receive_messages.empty():
+            exit()
         receive_messages.get()
         start = time()
         minimise = 0
@@ -410,7 +472,7 @@ def trainingMonitor(send_messages: multiprocessing.Queue, model_args):
             send_messages.put(1)
             send_messages.put(trainers_RLPIDs)
             send_messages.close()
-            sleep(10)
+            sleep(INSTANCE_SETUP_TIME + 10)
             minimiseRL(trainers_RLPIDs)
             #trainer exit process and restart
     except KeyboardInterrupt:
@@ -454,48 +516,68 @@ def start_starter(messages: Dict[str, multiprocessing.Queue], monitors: Dict[str
         sleep(5)
 
 if __name__ == "__main__":
-    messages: Dict[str, multiprocessing.Queue] = {}
-    monitors: Dict[str, multiprocessing.Process] = {}
-    model_instances: Dict[str, List[int]]  = {}
-    models_used: Dict[str, List]  = {}
-    all_instances = []
-    initial_instances = getRLInstances()
-    #no try and catch is needed during startup as the starters will clean themselves up
-    #RLGym can't have reopened a RL instance yet
-    for model_args in models:
-        model_instances[model_args[0]] = start_starter(messages, monitors, model_args, initial_instances, all_instances)
-        all_instances.extend(model_instances[model_args[0]])
-        models_used[model_args[0]] = model_args
-    print(">Finished starting trainers")
+    #start redis
+    print(">Starting redis")
+    os.system("wsl sudo redis-server /etc/redis/redis.conf --daemonize yes")
+    r = Redis(host="127.0.0.1", password=pickleData["REDIS"])
     try:
-        while True:
+        messages: Dict[str, multiprocessing.Queue] = {}
+        monitors: Dict[str, multiprocessing.Process] = {}
+        model_instances: Dict[str, List[int]]  = {}
+        models_used: Dict[str, List]  = {}
+        all_instances = []
+        initial_instances = getRLInstances()
+        #no try and catch is needed during startup as the starters will clean themselves up
+        #RLGym can't have reopened a RL instance yet
+        for model_args in models:
+            model_instances[model_args[0]] = start_starter(messages, monitors, model_args, initial_instances, all_instances)
+            all_instances.extend(model_instances[model_args[0]])
+            models_used[model_args[0]] = model_args
+        print(">Finished starting trainers")
+        try:
+            while True:
+                for key in monitors:
+                    monitor = monitors[key]
+                    if monitor.is_alive():
+                        sleep(1)
+                    else:
+                        print(">Trainer crashed")
+                        #Kill instances that weren't present before and weren't reported by trainer
+                        blacklist = initial_instances.copy()
+                        blacklist.append(all_instances)
+                        killRL(blacklist=blacklist)
+                        model_args = models_used[key]
+                        #kill trainer's instances
+                        killRL(model_instances[key])
+                        #add logic to detect not all were killed and to search for extra instances, if they match kill them
+                        # if an instance crashes RLgym restarts it
+                        messages[key].close()
+                        sleep(1)
+                        model_instances[key] = start_starter(messages, monitors, model_args, initial_instances, all_instances)
+                    #trainer died restart loop
+        except KeyboardInterrupt:
             for key in monitors:
                 monitor = monitors[key]
-                if monitor.is_alive():
-                    sleep(1)
-                else:
-                    print(">Trainer crashed")
-                    #Kill instances that weren't present before and weren't reported by trainer
-                    blacklist = initial_instances.copy()
-                    blacklist.append(all_instances)
-                    killRL(blacklist=blacklist)
-                    model_args = models_used[key]
-                    #kill trainer's instances
-                    killRL(model_instances[key])
-                    #add logic to detect not all were killed and to search for extra instances, if they match kill them
-                    # if an instance crashes RLgym restarts it
-                    messages[key].close()
-                    sleep(1)
-                    model_instances[key] = start_starter(messages, monitors, model_args, initial_instances, all_instances)
-                #trainer died restart loop
-    except KeyboardInterrupt:
-        for key in monitors:
-            monitor = monitors[key]
-            #trainers will shut down and save, please wait
-            while monitor.is_alive():
-                sleep(0.1)
-            messages[key].close()
-            #kill instances reported
-            #killRL(all_instances)
-            #Kill instances that weren't present before
-            killRL(blacklist=initial_instances)
+                #trainers will shut down and save, please wait
+                while monitor.is_alive():
+                    sleep(0.1)
+                messages[key].close()
+                #kill instances reported
+                #killRL(all_instances)
+                #Kill instances that weren't present before
+                killRL(blacklist=initial_instances)
+    except:
+        pass
+    finally:
+        #kill redis
+        r.shutdown()
+
+"""
+DEL save-freq
+DEL model-latest
+DEL model-version
+DEL qualities
+DEL num-updates
+DEL opponent-models
+DEL worker-ids
+"""

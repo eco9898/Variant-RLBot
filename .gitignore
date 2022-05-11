@@ -1,3 +1,7 @@
+#Protect api key and redis password
+src/trainer/pickle*
+wandb*
+
 #auto-generated
 # Byte-compiled / optimized / DLL files
 __pycache__/

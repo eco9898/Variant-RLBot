@@ -1,12 +1,22 @@
 from time import sleep
 import numpy as np
-import psutil
+import psutil, pathlib, sys
 import win32gui, win32con, win32process, os, signal
 from rlgym.utils.common_values import ORANGE_TEAM, BLUE_TEAM, ORANGE_GOAL_BACK, BLUE_GOAL_BACK, ORANGE_GOAL_CENTER, BLUE_GOAL_CENTER, BACK_WALL_Y, CAR_MAX_SPEED, BALL_MAX_SPEED
 from rlgym.utils.reward_functions.common_rewards.conditional_rewards import ConditionalRewardFunction
 from rlgym.utils import RewardFunction, math
 from rlgym.utils.gamestates import PlayerData, GameState
 from typing import List
+
+parent_directory = str(pathlib.Path(__file__).parent.parent.resolve())
+sys.path.append(parent_directory)
+from utils.advanced_padder import AdvancedObsPadder
+
+# ROCKET-LEARN ALWAYS EXPECTS A BATCH DIMENSION IN THE BUILT OBSERVATION
+class ExpandAdvancedObs(AdvancedObsPadder):
+    def build_obs(self, player: PlayerData, state: GameState, previous_action: np.ndarray):
+        obs = super(ExpandAdvancedObs, self).build_obs(player, state, previous_action)
+        return np.expand_dims(obs, 0)
 
 def getRLInstances():
     '''
