@@ -1,2 +1,2 @@
-Strain is a machine learning bot with two brains, one has learnt to master kickoffs, while the other focuses on the match.
-Strain is named after DNA strains, each model of Strain is a different evolutionary strain of their DNA.
+Variant is a machine learning bot with 4 brains, one has learnt to master kickoffs, while the other focuses offense, defense, and goal keeping.
+This bot is Strains' big brother. Variant is named similarily to strain, each model of Variant is a different evolutionary variant of their DNA.
