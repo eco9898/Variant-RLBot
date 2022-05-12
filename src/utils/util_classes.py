@@ -2,15 +2,25 @@ from time import sleep
 import numpy as np
 import psutil, pathlib, sys
 import win32gui, win32con, win32process, os, signal
+from rlgym.envs import Match
 from rlgym.utils.common_values import ORANGE_TEAM, BLUE_TEAM, ORANGE_GOAL_BACK, BLUE_GOAL_BACK, ORANGE_GOAL_CENTER, BLUE_GOAL_CENTER, BACK_WALL_Y, CAR_MAX_SPEED, BALL_MAX_SPEED
 from rlgym.utils.reward_functions.common_rewards.conditional_rewards import ConditionalRewardFunction
 from rlgym.utils import RewardFunction, math
 from rlgym.utils.gamestates import PlayerData, GameState
+from rlgym.utils.state_setters import RandomState
+from rlgym.utils.terminal_conditions.common_conditions import *
+from rlgym.utils.reward_functions.common_rewards.misc_rewards import *
+from rlgym.utils.reward_functions.common_rewards.player_ball_rewards import *
+from rlgym.utils.reward_functions.common_rewards.ball_goal_rewards import *
+from rlgym.utils.reward_functions.common_rewards.conditional_rewards import *
+from rlgym.utils.reward_functions import CombinedReward
 from typing import List
 
 parent_directory = str(pathlib.Path(__file__).parent.parent.resolve())
 sys.path.append(parent_directory)
 from utils.advanced_padder import AdvancedObsPadder
+from utils.discrete_act import DiscreteAction
+from utils.modified_states import *
 
 # ROCKET-LEARN ALWAYS EXPECTS A BATCH DIMENSION IN THE BUILT OBSERVATION
 class ExpandAdvancedObs(AdvancedObsPadder):
@@ -52,6 +62,7 @@ def minimiseRL(targets: List = []):
     winlist.clear()
     win32gui.EnumWindows(enum_callback, toplist)
     Rl = [(hwnd, title) for hwnd, title in winlist if 'Rocket League (64-bit, DX11, Cooked)'.lower() in title.lower()]
+    #worker = [(hwnd, title) for hwnd, title in winlist if '_Worker'.lower() in title.lower()]
     # just grab the first window that matches
     for win in Rl:
         # use the window handle to set focus
@@ -60,9 +71,15 @@ def minimiseRL(targets: List = []):
         #print("Found", pid)
         #print("targets:", targets)
         if pid in targets:
-            print ("Minimising:", pid)
+            print ("Minimising RL:", pid)
             win32gui.ShowWindow(win[0], win32con.SW_MINIMIZE)
             sleep(1)
+    #for win in worker:
+    #    pid = win32process.GetWindowThreadProcessId(win[0])[1]
+    #    print ("Minimising Worker:", pid)
+    #    win32gui.ShowWindow(win[0], win32con.SW_MINIMIZE)
+    #    sleep(0.2)
+
 
 def killRL(targets: List = [], blacklist: List = []):
     PIDs = getRLInstances()
@@ -315,9 +332,6 @@ class RewardIfMidFromBall(ConditionalRewardFunction):
                     min = dist2
         return dist != max and dist != min
 
-
-#crowd-sourced
-
 class JumpTouchReward(RewardFunction):
     """
     a ball touch reward that only triggers when the agent's wheels aren't in contact with the floor
@@ -338,3 +352,126 @@ class JumpTouchReward(RewardFunction):
             return ((state.ball.position[2] - 92) ** self.exp)-1
 
         return 0
+
+
+
+attackRewards = CombinedReward(
+    (
+        VelocityPlayerToBallReward(),
+        LiuDistancePlayerToBallReward(),
+        RewardIfTouchedLast(LiuDistanceBallToGoalReward()),
+        RewardIfTouchedLast(VelocityBallToGoalReward()),
+        RewardIfClosestToBall(AlignBallGoal(0,1), True),
+    ),
+    (2.0, 0.2, 1.0, 1.0, 0.8))
+
+defendRewards = CombinedReward(
+    (
+        VelocityPlayerToBallReward(),
+        LiuDistancePlayerToBallReward(),
+        RewardIfTouchedLast(LiuDistanceBallToGoalReward()),
+        RewardIfTouchedLast(VelocityBallToGoalReward()),
+        AlignBallGoal(1,0)
+    ),
+    (1.0, 0.2, 1.0, 1.0, 1.5))
+
+lastManRewards = CombinedReward(
+    (
+        RewardIfTouchedLast(VelocityBallToGoalReward()),
+        AlignBallGoal(1,0),
+        LiuDistancePlayerToGoalReward(),
+        ConstantReward()
+    ),
+    (2.0, 1.0, 0.6, 0.2))
+
+kickoffRewards = CombinedReward(
+    (
+        RewardIfClosestToBall(
+            CombinedReward(
+                (
+                    VelocityPlayerToBallReward(),
+                    AlignBallGoal(0,1),
+                    LiuDistancePlayerToBallReward(),
+                    FlipReward(),
+                    useBoost()
+                ),
+                (20.0, 1.0, 2.0, 2.0, 5.0)
+            ),
+            team_only=True
+        ),
+        RewardIfMidFromBall(defendRewards),
+        RewardIfFurthestFromBall(lastManRewards),
+        TeamSpacingReward(),
+        pickupBoost()
+    ),
+    (2.0, 1.0, 1.5, 1.0, 0.4))
+
+def get_base_match(team_size):
+    return Match(
+        team_size=team_size,
+        game_speed=100,
+        self_play=True,
+        obs_builder=ExpandAdvancedObs(3),
+        action_parser=DiscreteAction(),
+        reward_function= CombinedReward((), ()),
+        terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()],
+        state_setter = RandomState()  # Resets to random
+    )
+
+def get_match(team_size):
+    match: Match = get_base_match(team_size)
+    match._reward_fn = CombinedReward(
+        (
+            RewardIfAttacking(attackRewards),
+            RewardIfDefending(defendRewards),
+            RewardIfLastMan(lastManRewards),
+            VelocityReward(),
+            FaceBallReward(),
+            EventReward(
+                team_goal=100.0,
+                goal=10.0 * team_size,
+                concede=-100.0 + (10.0 * team_size),
+                shot=10.0,
+                save=30.0,
+                demo=12.0,
+            ),
+            JumpTouchReward(),
+            TouchBallReward(1.2),
+            TeamSpacingReward(1500),
+            FlipReward(),
+            SaveBoostReward(),
+            pickupBoost(),
+            useBoost()
+        ),
+        (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
+    match._terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()]
+    match._state_setter = RandomState()  # Resets to random
+    return match
+
+def get_kickoff(team_size):
+    match: Match = get_base_match(team_size)
+    match._reward_fn = CombinedReward(
+        (
+            kickoffRewards,
+            VelocityReward(),
+            FaceBallReward(),
+            EventReward(
+                team_goal=100.0,
+                goal=10.0 * team_size,
+                concede=-100.0 + (10.0 * team_size),
+                shot=10.0,
+                save=30.0,
+                demo=12.0,
+            ),
+            JumpTouchReward(),
+            TouchBallReward(1.2),
+            TeamSpacingReward(1500),
+            FlipReward(),
+            SaveBoostReward(),
+            pickupBoost(),
+            useBoost(),
+        ),
+        (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16))
+    match._terminal_conditions = [TimeoutCondition(2000), GoalScoredCondition()]
+    match._state_setter = ModifiedState()  # Resets to kickoff position
+    return match

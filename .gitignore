@@ -1,6 +1,7 @@
 #Protect api key and redis password
 src/trainer/pickle*
 wandb*
+src/data/worker-logs*
 
 #auto-generated
 # Byte-compiled / optimized / DLL files
