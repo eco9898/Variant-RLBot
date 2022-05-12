@@ -1,4 +1,4 @@
-import sys, multiprocessing, pathlib, os, pickle, torch, torch.jit, wandb
+import sys, multiprocessing, pathlib, os, pickle, torch, torch.jit, wandb, socket
 from time import sleep, time
 from typing import Dict
 import numpy as np
@@ -72,7 +72,7 @@ def runWorker(match):
 
     # LAUNCH ROCKET LEAGUE AND BEGIN TRAINING
     # -past_version_prob SPECIFIES HOW OFTEN OLD VERSIONS WILL BE RANDOMLY SELECTED AND TRAINED AGAINST
-    RedisRolloutWorker(r, "Variant", match, 
+    RedisRolloutWorker(r, socket.gethostname(), match, 
         past_version_prob=0,#.2, 
         evaluation_prob=0,#.01,
         sigma_target=1,
@@ -112,7 +112,7 @@ def runLearner(send_messages: multiprocessing.Queue, save_dir, rewards):
     # -clear DELETE REDIS ENTRIES WHEN STARTING UP (SET TO FALSE TO CONTINUE WITH OLD AGENTS)
     rollout_gen = RedisRolloutGenerator(redis, ExpandAdvancedObs, rewards, DiscreteAction,
                                         logger=logger,
-                                        save_every=1,
+                                        save_every=10,
                                         clear=False)
     print("Rollout init")
 
@@ -171,7 +171,7 @@ def runLearner(send_messages: multiprocessing.Queue, save_dir, rewards):
     # -iterations_per_save SPECIFIES HOW OFTEN CHECKPOINTS ARE SAVED
     # -save_dir SPECIFIES WHERE
     send_messages.put(1)
-    alg.run(iterations_per_save=1, save_dir=save_dir)
+    alg.run(iterations_per_save=10, save_dir=save_dir)
 
 def startTraining(send_messages: multiprocessing.Queue, model_args: List):
     global paging, wait_time, total_num_instances, run_learner, run_workers
