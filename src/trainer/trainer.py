@@ -1,6 +1,5 @@
 import sys, multiprocessing, pathlib, os, pickle, torch, torch.jit, wandb
 from time import sleep, time
-from  datetime import datetime
 from typing import Dict
 import numpy as np
 from rlgym.envs import Match
@@ -19,10 +18,9 @@ from rocket_learn.agent.discrete_policy import DiscretePolicy
 from rocket_learn.ppo import PPO
 from rocket_learn.rollout_generator.redis_rollout_generator import RedisRolloutGenerator
 from rocket_learn.utils.util import SplitLayer
-
+#Comment line 69-72 of wandb.sdk.internal.stats
 parent_directory = str(pathlib.Path(__file__).parent.parent.resolve())
 sys.path.append(parent_directory)
-
 from utils.discrete_act import DiscreteAction
 from utils.util_classes import *
 from utils.modified_states import *
@@ -32,8 +30,11 @@ WAIT_TIME_NO_PAGING = 20
 WAIT_TIME_PAGING = 35
 INSTANCE_SETUP_TIME = 50 #for safety
 
-total_num_instances = 5
-run_learner = True
+total_num_instances = 3
+run_learner = False
+run_workers = True
+run_workers = not run_learner
+clear_redis = False
 kickoff_instances = total_num_instances // 3
 match_instances = total_num_instances - kickoff_instances
 models: List = [["kickoff", kickoff_instances], ["match", match_instances]]
@@ -72,16 +73,17 @@ def runWorker(match):
     # LAUNCH ROCKET LEAGUE AND BEGIN TRAINING
     # -past_version_prob SPECIFIES HOW OFTEN OLD VERSIONS WILL BE RANDOMLY SELECTED AND TRAINED AGAINST
     RedisRolloutWorker(r, "Variant", match, 
-        past_version_prob=.2, 
-        evaluation_prob=0.01, 
+        past_version_prob=0,#.2, 
+        evaluation_prob=0,#.01,
         sigma_target=1,
         streamer_mode=False, 
         send_gamestates=False, 
         pretrained_agents=None, 
         human_agent=None,
-        deterministic_old_prob=0.5).run()
+        deterministic_old_prob=0#.5
+    ).run()
 
-def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, save_dir, rewards):
+def runLearner(send_messages: multiprocessing.Queue, save_dir, rewards):
     global pickleData
     print("Learner instance started")
     """
@@ -90,6 +92,7 @@ def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, s
     based on results, and sends updated model parameters out to the workers
     
     """
+    #os.environ["WANDB_MODE"]="offline"
 
     # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
     # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
@@ -109,7 +112,7 @@ def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, s
     # -clear DELETE REDIS ENTRIES WHEN STARTING UP (SET TO FALSE TO CONTINUE WITH OLD AGENTS)
     rollout_gen = RedisRolloutGenerator(redis, ExpandAdvancedObs, rewards, DiscreteAction,
                                         logger=logger,
-                                        save_every=100,
+                                        save_every=1,
                                         clear=False)
     print("Rollout init")
 
@@ -122,19 +125,19 @@ def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, s
     state_dim = 231
 
     critic = Sequential(
-        Linear(state_dim, 256),
+        Linear(state_dim, 512),
         ReLU(),
-        Linear(256, 256),
+        Linear(512, 512),
         ReLU(),
-        Linear(256, 1)
+        Linear(512, 1)
     )
 
     actor = DiscretePolicy(Sequential(
-        Linear(state_dim, 256),
+        Linear(state_dim, 512),
         ReLU(),
-        Linear(256, 256),
+        Linear(512, 512),
         ReLU(),
-        Linear(256, total_output),
+        Linear(512, total_output),
         SplitLayer(splits=split)
     ), split)
 
@@ -150,11 +153,11 @@ def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, s
         rollout_gen,
         agent,
         ent_coef=0.01,
-        n_steps=steps,
-        batch_size=batch_size,
-        minibatch_size=batch_size / 2,
+        n_steps=1_000_000,
+        batch_size=20_000,
+        minibatch_size=10_000,
         epochs=10,
-        gamma=gamma,
+        gamma=599/600,
         clip_range=0.2,
         gae_lambda=0.95,
         vf_coef=1,
@@ -168,62 +171,19 @@ def runLearner(send_messages: multiprocessing.Queue, steps, batch_size, gamma, s
     # -iterations_per_save SPECIFIES HOW OFTEN CHECKPOINTS ARE SAVED
     # -save_dir SPECIFIES WHERE
     send_messages.put(1)
-    alg.run(iterations_per_save=100, save_dir=save_dir)
+    alg.run(iterations_per_save=1, save_dir=save_dir)
 
-"""if __name__ == '__main__':
-    match = Match(
-            game_speed=100,
-            self_play=True,
-            team_size=1,
-            state_setter=DefaultState(),
-            obs_builder=ExpandAdvancedObs(),
-            action_parser=DiscreteAction(),
-            terminal_conditions=[TimeoutCondition(round(2000)),
-                                GoalScoredCondition()],
-            reward_function=JumpTouchReward()
-        )
-    learner = multiprocessing.Process(target=runLearner, args=[1000000, 1000000, np.exp(np.log(0.5) / (120 * 5)), data_location + "models/", JumpTouchReward])
-    learner.start()
-    sleep(20)
-
-    worker = multiprocessing.Process(target=runWorker, args=[match])
-    worker.start()
-
-    sleep(100)"""
 def startTraining(send_messages: multiprocessing.Queue, model_args: List):
-    global paging, wait_time, total_num_instances, run_learner
+    global paging, wait_time, total_num_instances, run_learner, run_workers
     name = model_args[0]
     num_instances = model_args[1]
-    frame_skip = 8          # Number of ticks to repeat an action
-    half_life_seconds = 5   # Easier to conceptualize, after this many seconds the reward discount is 0.5
 
-    reward_log_file = data_location + "logs/" + name + "/reward_" + str(datetime.now().hour) + "-" + str(datetime.now().minute)
-
-    fps = 120/frame_skip #120 / frame_skip
-    gamma = np.exp(np.log(0.5) / (fps * half_life_seconds))  # Quick mafs
     team_size = 3
-    self_play = True
-    if self_play:
-        agents_per_match = 2*team_size
-    else:
-        agents_per_match = team_size
-    n_env = agents_per_match * num_instances
-    print(">>>Wait time:        ", wait_time)
-    print(">>># of instances:   ", num_instances)
-    print(">>># of trainers:    ", n_env)
-    print(">>>Paging:           ", paging)
-    print(">>># of env:         ", n_env)
-    target_steps = int(1_000_000)#*(num_instances/total_num_instances))
-    steps = target_steps//n_env #making sure the experience counts line up properly
-    print(">>>Steps:            ", steps)
-    batch_size = (100_000//(steps))*(steps) #getting the batch size down to something more manageable - 80k in this case at 5 instances, but 25k at 16 instances
-    if batch_size == 0:
-        batch_size = steps
-    print(">>>Batch size:       ", batch_size)
-    training_interval = int(25_000_000)#*(num_instances/total_num_instances))
-    print(">>>Training interval:", training_interval)
-    mmr_save_frequency = 50_000_000
-    print(">>>MMR frequency:    ", mmr_save_frequency)
+    if run_workers:
+        print(">>>Wait time:        ", wait_time)
+        print(">>># of instances:   ", num_instances)
+        print(">>># of trainers:    ", 2 * team_size * num_instances)
+        print(">>>Paging:           ", paging)
     attackRewards = CombinedReward(
         (
             VelocityPlayerToBallReward(),
@@ -275,16 +235,15 @@ def startTraining(send_messages: multiprocessing.Queue, model_args: List):
         ),
         (2.0, 1.0, 1.5, 1.0, 0.4))
 
-    def get_base_match():  # Need to use a function so that each instance can call it and produce their own objects
+    def get_base_match():
         return Match(
-            team_size=team_size, #amount of bots per team
-            tick_skip=frame_skip,
+            team_size=team_size,
             game_speed=100,
-            self_play=self_play, #play against its self
-            obs_builder=ExpandAdvancedObs(3),  # Not that advanced, good default
-            action_parser=DiscreteAction(),  # Discrete > Continuous don't @ me
+            self_play=True,
+            obs_builder=ExpandAdvancedObs(3),
+            action_parser=DiscreteAction(),
             reward_function= CombinedReward((), ()),
-            terminal_conditions = [TimeoutCondition(fps * 300), NoTouchTimeoutCondition(fps * 120), GoalScoredCondition()],
+            terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()],
             state_setter = RandomState()  # Resets to random
         )
 
@@ -314,7 +273,7 @@ def startTraining(send_messages: multiprocessing.Queue, model_args: List):
                 useBoost()
             ),
             (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
-        match._terminal_conditions = [TimeoutCondition(fps * 300), NoTouchTimeoutCondition(fps * 120), GoalScoredCondition()]
+        match._terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()]
         match._state_setter = RandomState()  # Resets to random
         return match
 
@@ -342,8 +301,7 @@ def startTraining(send_messages: multiprocessing.Queue, model_args: List):
                 useBoost(),
             ),
             (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16))
-        #time out after 12 seconds encourage kickoff
-        match._terminal_conditions = [TimeoutCondition(fps * 12), GoalScoredCondition()]
+        match._terminal_conditions = [TimeoutCondition(2000), GoalScoredCondition()]
         match._state_setter = ModifiedState()  # Resets to kickoff position
         return match
     
@@ -354,42 +312,86 @@ def startTraining(send_messages: multiprocessing.Queue, model_args: List):
     if run_learner:
         print(">>>Starting learner")
         receive_messages = multiprocessing.Queue()
-        learner = multiprocessing.Process(target=runLearner, args=[receive_messages, steps, batch_size, gamma, data_location + "models/" + name, match()._reward_fn])
+        learner = multiprocessing.Process(target=runLearner, args=[receive_messages, data_location + "models/" + name, match()._reward_fn])
         learner.start()
         #Give it time to start
         while receive_messages.qsize() == 0:
-            sleep(15)
+            sleep(1)
         receive_messages.get()
+        if run_workers:
+            sleep(15)
     else:
         print(">>>Skipping learner")
     send_messages.put(1)
-    workers: List[multiprocessing.Process]= []
-    for i in range(num_instances):
-        print(">>>Starting worker:", i)
-        worker = multiprocessing.Process(target=runWorker, args=[match()])
-        worker.start()
-        workers.append(worker)
-        sleep(wait_time)
+    sleep(1)
+    while not send_messages.empty():
+        sleep(1)
+    if run_workers:
+        workers: List[multiprocessing.Process]= []
+        workersPID: List[int]= []
+        for i in range(num_instances):
+            print(">>>Starting worker:", i + 1)
+            worker = multiprocessing.Process(target=runWorker, args=[match()])
+            worker.start()
+            workers.append(worker)
+            while send_messages.empty():
+                sleep(0.5)
+            workersPID.append(send_messages.get())
+            sleep(wait_time)
     send_messages.put(2)
     send_messages.close()
     try:
         while True:
-            for worker in workers:
-                if worker.is_alive():
+            if run_learner and not learner.is_alive():
+                print(">>>Restarting learner")
+                learner = multiprocessing.Process(target=runLearner, args=[receive_messages, data_location + "models/" + name, match()._reward_fn])
+                learner.start()
+                while receive_messages.qsize() == 0:
                     sleep(1)
-                else:
-                    print(">>>Restarting worker")
-                    worker = multiprocessing.Process(target=runWorker, args=[match()])
-                    worker.start()
-                    sleep(wait_time)
+                receive_messages.get()
+            if run_workers:
+                for i in range(num_instances):
+                    if workers[i].is_alive():
+                        sleep(1)
+                    else:
+                        print(">>>Restarting worker")
+                        old_pid =  workersPID[i]
+                        workersPIDCopy = workersPID.copy()
+                        workersPIDCopy.remove(old_pid)
+                        killRL([old_pid])
+                        workers[i] = multiprocessing.Process(target=runWorker, args=[match()])
+                        workers[i].start()
+                        while workersPID[i] == old_pid:
+                            sleep(1)
+                            curr_PIDs = getRLInstances()
+                            #Check for new instance
+                            for pid in curr_PIDs:
+                                if pid not in workersPID:
+                                    new_instance = True
+                                    print(">>>Instance found")
+                                    workersPID[i] = pid
+                                    break
+                        sleep(INSTANCE_SETUP_TIME)
+                        killRL(blacklist=workersPID)
+                        minimiseRL([workersPID[i]])
+            if not run_workers and not run_learner:
+                print(">>>Nothing to open")
+                sleep(100)
+
     except KeyboardInterrupt:
-        #Wait for workers to die
+        pass
+    #Wait for workers to die
+    if run_workers:
+        for worker in workers:
+            worker.kill()
         for worker in workers:
             while worker.is_alive():
-                sleep(0.1)
-        #Wait for learner to die
+                sleep(1)
+    #Wait for learner to die
+    if run_learner:
+        learner.terminate()
         while learner.is_alive():
-            sleep(0.1)
+            sleep(1)
 
 def trainingMonitor(send_messages: multiprocessing.Queue, model_args):
     global wait_time, paging
@@ -401,94 +403,111 @@ def trainingMonitor(send_messages: multiprocessing.Queue, model_args):
     receive_messages = multiprocessing.Queue()
     trainer = multiprocessing.Process(target=startTraining, args=[receive_messages, model_args])
     trainer.start()
-    try:
-        count = 0
-        #Wait until setup is printed
-        while receive_messages.empty() and trainer.is_alive():
-            sleep(1)
-        if receive_messages.empty():
-            exit()
-        receive_messages.get()
-        start = time()
-        minimise = 0
-        instance_crashed = False
-        while count < instances  and trainer.is_alive() and not instance_crashed:
-            print(">>Parsing instance:" + str(count + 1) + "+" + str(len(initial_RLPIDs)))
-            new_instance = False
-            if ((time() - start) // INSTANCE_SETUP_TIME > count):
-                print(">>Instance took too long")
-                break
-            while (time() - start) // INSTANCE_SETUP_TIME <= count and not instance_crashed and not new_instance:
-                sleep(0.2)
-                curr_PIDs = getRLInstances()
-                #clean initial instances
-                to_remove = []
-                for pid in initial_RLPIDs:
-                    if pid not in curr_PIDs:
-                        to_remove.append(pid) #store to remove later
-                for pid in to_remove:
-                    initial_RLPIDs.remove(pid)
-                #Check for new instance
-                for pid in curr_PIDs:
-                    if pid not in trainers_RLPIDs and pid not in initial_RLPIDs:
-                        count +=1
-                        new_instance = True
-                        print(">>Instances found:" + str(count) + "+" + str(len(initial_RLPIDs)))
-                        trainers_RLPIDs.append(pid)
-                        break
-                #Check if instance died
-                for pid in trainers_RLPIDs:
-                    if pid not in curr_PIDs:
-                        #trainer instance was closed
-                        instance_crashed = True
-                        break
-            #minimise done windows
-            #if (time() - start) // INSTANCE_SETUP_TIME > minimise:
-            #    minimiseRL([trainers_RLPIDs[minimise]])
-            #    minimise = (time() - start) // INSTANCE_SETUP_TIME
-        if instance_crashed:
-            print(">>Instance Died")
-        done = False
-        if count == instances:
-            print(">>Waiting to start")
-            try:
-                start = time()
-                while (time() - start) < INSTANCE_SETUP_TIME * 2 and trainer.is_alive():
-                    if not receive_messages.empty():
-                        break
-                    sleep(0.1)
-                if not receive_messages.empty() and trainer.is_alive():
-                    if receive_messages.get() == 2:
-                        done = True
-                receive_messages.close()
-            except KeyboardInterrupt:
-                killRL(trainers_RLPIDs)
+    if run_workers:
+        try:
+            count = 0
+            #Wait until setup is printed
+            while receive_messages.empty() and trainer.is_alive():
+                sleep(0.5)
+            if receive_messages.empty():
                 exit()
-        if count != instances or not done:
-            print(">>Killing trainer: " + model_args[0])
-            trainer.terminate()
-        else:
-            print(">>Finished parsing trainer: " + model_args[0])
-            send_messages.put(1)
-            send_messages.put(trainers_RLPIDs)
-            send_messages.close()
-            sleep(INSTANCE_SETUP_TIME + 10)
-            minimiseRL(trainers_RLPIDs)
-            #trainer exit process and restart
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(">>Error: with trainer parser")
-        #Continue to wait for trainer to die, then exit
+            receive_messages.get()
+            start = time()
+            minimise = 0
+            instance_crashed = False
+            while count < instances  and trainer.is_alive() and not instance_crashed:
+                print(">>Parsing instance:" + str(count + 1) + "+" + str(len(initial_RLPIDs)))
+                new_instance = False
+                if ((time() - start) // INSTANCE_SETUP_TIME > count):
+                    print(">>Instance took too long")
+                    break
+                while (time() - start) // INSTANCE_SETUP_TIME <= count and not instance_crashed and not new_instance:
+                    sleep(0.2)
+                    curr_PIDs = getRLInstances()
+                    #clean initial instances
+                    to_remove = []
+                    for pid in initial_RLPIDs:
+                        if pid not in curr_PIDs:
+                            to_remove.append(pid) #store to remove later
+                    for pid in to_remove:
+                        initial_RLPIDs.remove(pid)
+                    #Check for new instance
+                    for pid in curr_PIDs:
+                        if pid not in trainers_RLPIDs and pid not in initial_RLPIDs:
+                            count +=1
+                            new_instance = True
+                            print(">>Instances found:" + str(count) + "+" + str(len(initial_RLPIDs)))
+                            trainers_RLPIDs.append(pid)
+                            receive_messages.put(pid)
+                            break
+                    #Check if instance died
+                    for pid in trainers_RLPIDs:
+                        if pid not in curr_PIDs:
+                            #trainer instance was closed
+                            instance_crashed = True
+                            break
+                #minimise done windows
+                #if (time() - start) // INSTANCE_SETUP_TIME > minimise:
+                #    minimiseRL([trainers_RLPIDs[minimise]])
+                #    minimise = (time() - start) // INSTANCE_SETUP_TIME
+            if instance_crashed:
+                print(">>Instance Died")
+            done = False
+            if count == instances:
+                sleep(1)
+                while not receive_messages.empty() and trainer.is_alive():
+                    #wait for trainer to read pid
+                    sleep(1)
+                print(">>Waiting to start")
+                try:
+                    start = time()
+                    while (time() - start) < INSTANCE_SETUP_TIME * 2 and trainer.is_alive():
+                        if not receive_messages.empty():
+                            break
+                        sleep(0.1)
+                    if not receive_messages.empty() and trainer.is_alive():
+                        if receive_messages.get() == 2:
+                            done = True
+                    receive_messages.close()
+                except KeyboardInterrupt:
+                    killRL(trainers_RLPIDs)
+                    exit()
+            if count != instances or not done:
+                print(">>Killing trainer: " + model_args[0])
+                trainer.terminate()
+            else:
+                print(">>Finished parsing trainer: " + model_args[0])
+                send_messages.put(1)
+                send_messages.put(trainers_RLPIDs)
+                send_messages.close()
+                sleep(INSTANCE_SETUP_TIME + 10)
+                minimiseRL(trainers_RLPIDs)
+                #trainer exit process and restart
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(">>Error: with trainer parser")
+            #Continue to wait for trainer to die, then exit
     #trainer will shut down and save, please wait
     #after it has closed, RL instances will be killed
+    else:
+        print(">>Not monitoring instances")
+        while receive_messages.empty():
+            sleep(1)
+        receive_messages.get()
+        while receive_messages.empty():
+            sleep(1)
+        receive_messages.get()
+        send_messages.put(1)
+        send_messages.put([])
+        send_messages.close()
     while trainer.is_alive():
         sleep(1)
-    killRL(trainers_RLPIDs)
+    if run_workers:
+        killRL(trainers_RLPIDs)
     receive_messages.close()
     send_messages.close()
     
-
 def start_starter(messages: Dict[str, multiprocessing.Queue], monitors: Dict[str, multiprocessing.Process], model_args, initial_instances, all_instances):
     name = model_args[0]
     instances = model_args[1]
@@ -520,6 +539,8 @@ if __name__ == "__main__":
     print(">Starting redis")
     os.system("wsl sudo redis-server /etc/redis/redis.conf --daemonize yes")
     r = Redis(host="127.0.0.1", password=pickleData["REDIS"])
+    if clear_redis:
+        r.delete("save-freq", "model-latest", "model-version", "qualities", "num-updates", "opponent-models", "worker-ids")
     try:
         messages: Dict[str, multiprocessing.Queue] = {}
         monitors: Dict[str, multiprocessing.Process] = {}
@@ -571,13 +592,3 @@ if __name__ == "__main__":
     finally:
         #kill redis
         r.shutdown()
-
-"""
-DEL save-freq
-DEL model-latest
-DEL model-version
-DEL qualities
-DEL num-updates
-DEL opponent-models
-DEL worker-ids
-"""
