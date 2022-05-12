@@ -74,11 +74,11 @@ def killRL(targets: List = [], blacklist: List = []):
         else:
             targets.append(pid)
         if pid in targets:
-            print(">>Killing RL instance", pid)
+            print("xxKilling RL instance", pid)
             try:
                 os.kill(pid, signal.SIGTERM)
             except:
-                print(">>Failed")
+                print("xxFailed")
 
 class TeamSpacingReward(RewardFunction):
     def __init__(self, min_spacing: float = 1000) -> None:
