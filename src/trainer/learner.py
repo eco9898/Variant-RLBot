@@ -1,5 +1,6 @@
-import sys, pathlib, pickle, torch, torch.jit, wandb
+import sys, pathlib, pickle, torch, torch.jit, wandb, os, glob
 from redis import Redis
+from time import sleep
 from torch.nn import Linear, Sequential, ReLU
 from rocket_learn.agent.actor_critic_agent import ActorCriticAgent
 from rocket_learn.agent.discrete_policy import DiscretePolicy
@@ -13,9 +14,14 @@ from utils.util_classes import get_kickoff, get_match, ExpandAdvancedObs
 
 if __name__ == "__main__":
     print("Learner instance started")
-    save_dir = sys.argv[1]
-    name = sys.argv[2]
-    team_size = int(sys.argv[3])
+    if len(sys.argv) == 4:
+        save_dir = sys.argv[1]
+        name = sys.argv[2]
+        team_size = int(sys.argv[3])
+    else:
+        save_dir = "src/data/models/match"
+        name = "match"
+        team_size = 3
     pickle_directory = parent_directory + "/trainer/"
     pickleData = pickle.load(open(pickle_directory + "pickleData.obj","rb"))
     """
@@ -26,16 +32,35 @@ if __name__ == "__main__":
     """
     #os.environ["WANDB_MODE"]="offline"
 
+    config = {
+        "actor_lr":5e-5,
+        "critic_lr":5e-5,
+        "n_steps":1_000_000,
+        "batch_size":200_000,
+        "minibatch_size":20_000,
+        "epochs":30,
+        "gamma":0.9975,
+        "iterations_per_save":1,
+        "ent_coef":0.01,
+        "clip_range":0.2
+    }
+
     # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
     # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
+    wandb_id = None #resume run
     wandb.login(key=pickleData["WANDB_KEY"])
-    logger = wandb.init(project="Variant", entity=pickleData["ENTITY"])
-    logger.name = "Variant"
+    logger = wandb.init(name = name, project="Variant", entity=pickleData["ENTITY"], id=wandb_id, config=config, resume=wandb_id is not None)
     print("Wandb init")
 
     # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
     # CONFIG)
-    redis = Redis(password=pickleData["REDIS"])
+    try:
+        redis = Redis(password=pickleData["REDIS"])
+        redis.get("*")
+    except:
+        os.system("wsl sudo redis-server /etc/redis/redis.conf --daemonize yes")
+        sleep(1)
+        redis = Redis(password=pickleData["REDIS"])
     print("Redis init")
 
     if name == "kickoff":
@@ -50,8 +75,8 @@ if __name__ == "__main__":
     # -clear DELETE REDIS ENTRIES WHEN STARTING UP (SET TO FALSE TO CONTINUE WITH OLD AGENTS)
     rollout_gen = RedisRolloutGenerator(redis, ExpandAdvancedObs, rewards, DiscreteAction,
                                         logger=logger,
-                                        save_every=10,
-                                        clear=False)
+                                        save_every=config["iterations_per_save"],
+                                        clear=wandb_id is None)
     print("Rollout init")
 
     # ROCKET-LEARN EXPECTS A SET OF DISTRIBUTIONS FOR EACH ACTION FROM THE NETWORK, NOT
@@ -80,8 +105,8 @@ if __name__ == "__main__":
     ), split)
 
     optim = torch.optim.Adam([
-        {"params": actor.parameters(), "lr": 5e-5},
-        {"params": critic.parameters(), "lr": 5e-5}
+        {"params": actor.parameters(), "lr": config["actor_lr"]},
+        {"params": critic.parameters(), "lr": config["critic_lr"]}
     ])
 
     # PPO REQUIRES AN ACTOR/CRITIC AGENT
@@ -90,22 +115,27 @@ if __name__ == "__main__":
     alg = PPO(
         rollout_gen,
         agent,
-        ent_coef=0.01,
-        n_steps=1_000_000,
-        batch_size=20_000,
-        minibatch_size=10_000,
-        epochs=10,
-        gamma=599/600,
-        clip_range=0.2,
-        gae_lambda=0.95,
+        ent_coef=config["ent_coef"],
+        n_steps=config["n_steps"],
+        batch_size=config["batch_size"],
+        minibatch_size=config["minibatch_size"],
+        epochs=config["epochs"],
+        gamma=config["gamma"],
+        clip_range=config["clip_range"],
         vf_coef=1,
         max_grad_norm=0.5,
         logger=logger,
         device="cuda"
     )
-
+    if wandb_id is not None:
+        checkpint_path = save_dir + "/**.pt"
+        files = glob.glob(checkpint_path, recursive=True)
+        newest_model = max(files, key=os.path.getctime)[0:-4]
+        alg.load(newest_model)
+        alg.agent.optimizer.param_groups[0]["lr"] = config["actor_lr"]
+        alg.agent.optimizer.param_groups[1]["lr"] = config["critic_lr"]
     print("PPO init")
     # BEGIN TRAINING. IT WILL CONTINUE UNTIL MANUALLY STOPPED
     # -iterations_per_save SPECIFIES HOW OFTEN CHECKPOINTS ARE SAVED
     # -save_dir SPECIFIES WHERE
-    alg.run(iterations_per_save=10, save_dir=save_dir)
+    alg.run(iterations_per_save=config["iterations_per_save"], save_dir=save_dir)

@@ -8,12 +8,20 @@ from utils.util_classes import get_kickoff, get_match
 if __name__ == "__main__":
     print ("Worker instance started")
     os.system("title Variant_Worker")
-    name = sys.argv[1]
-    team_size = int(sys.argv[2])
+    if len(sys.argv) == 3:
+        name = sys.argv[1]
+        team_size = int(sys.argv[2])
+        streamer = False
+    else:
+        name = "match"
+        team_size = 3
+        streamer = False
     if name == "kickoff":
         match = get_kickoff(team_size)
     else:
         match = get_match(team_size)
+    if streamer:
+        match._game_speed = 1
     pickle_directory = parent_directory + "/trainer/"
 
     pickleData = pickle.load(open(pickle_directory + "pickleData.obj","rb"))
@@ -38,7 +46,7 @@ if __name__ == "__main__":
         past_version_prob=0,#.2, 
         evaluation_prob=0,#.01,
         sigma_target=1,
-        streamer_mode=False, 
+        streamer_mode=streamer, 
         send_gamestates=False, 
         pretrained_agents=None, 
         human_agent=None,

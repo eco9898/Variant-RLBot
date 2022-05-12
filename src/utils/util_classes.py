@@ -443,7 +443,8 @@ def get_match(team_size):
             pickupBoost(),
             useBoost()
         ),
-        (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
+        #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
+        (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.01, 0.35, 1.06, 71.35))
     match._terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()]
     match._state_setter = RandomState()  # Resets to random
     return match

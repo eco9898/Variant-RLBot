@@ -116,3 +116,4 @@ ENV/
 # VSCode
 .vscode/
 *.code-workspace
+run wandb-cli.txt

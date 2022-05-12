@@ -19,7 +19,6 @@ total_num_instances = 3
 run_learner = True
 run_workers = True
 #run_workers = not run_learner
-clear_redis = False
 kickoff_instances = total_num_instances // 3
 match_instances = total_num_instances - kickoff_instances
 models: List = [["kickoff", kickoff_instances], ["match", match_instances]]
@@ -106,6 +105,7 @@ def startTraining(send_messages: multiprocessing.Queue, model_args: List):
                         sleep(INSTANCE_SETUP_TIME)
                         killRL(blacklist=workersPID)
                         minimiseRL([workersPID[i]])
+                        getRLInstances() # kills EOSOverlay
             if not run_workers and not run_learner:
                 print(">>>Nothing to open")
                 sleep(100)
@@ -271,8 +271,6 @@ if __name__ == "__main__":
     print(">Starting redis")
     os.system("wsl sudo redis-server /etc/redis/redis.conf --daemonize yes")
     r = Redis(host="127.0.0.1", password=pickleData["REDIS"])
-    if clear_redis:
-        r.delete("save-freq", "model-latest", "model-version", "qualities", "num-updates", "opponent-models", "worker-ids")
     try:
         messages: Dict[str, multiprocessing.Queue] = {}
         monitors: Dict[str, multiprocessing.Process] = {}
