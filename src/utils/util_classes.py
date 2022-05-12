@@ -71,8 +71,8 @@ def killRL(targets: List = [], blacklist: List = []):
         if len(blacklist) > 0:
             if pid in blacklist:
                 continue
-        else:
-            targets.append(pid)
+            else:
+                targets.append(pid)
         if pid in targets:
             print("xxKilling RL instance", pid)
             try:
