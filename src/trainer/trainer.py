@@ -1,6 +1,5 @@
+import subprocess, sys, multiprocessing, pathlib, os, pickle, shutil
 from datetime import datetime
-import subprocess
-import sys, multiprocessing, pathlib, os, pickle
 from time import sleep, time
 from typing import Dict
 from redis import Redis
@@ -271,6 +270,9 @@ if __name__ == "__main__":
     print(">Starting redis")
     os.system("wsl sudo redis-server /etc/redis/redis.conf --daemonize yes")
     r = Redis(host="127.0.0.1", password=pickleData["REDIS"])
+    #Clear worker logs
+    shutil.rmtree(data_location + "worker-logs", ignore_errors=True)
+    print(">Cleared worker logs")
     try:
         messages: Dict[str, multiprocessing.Queue] = {}
         monitors: Dict[str, multiprocessing.Process] = {}
