@@ -35,21 +35,27 @@ if __name__ == "__main__":
     config = {
         "actor_lr":5e-5,
         "critic_lr":5e-5,
-        "n_steps":1_000_000,
-        "batch_size":200_000,
+        "n_steps":500_000,
+        "batch_size":100_000,
         "minibatch_size":20_000,
+        #"n_steps":20_000,
+        #"batch_size":20_000,
+        #"minibatch_size":20_000,
         "epochs":30,
         "gamma":0.9975,
         "iterations_per_save":1,
         "ent_coef":0.01,
+        "vf_coef":1,
         "clip_range":0.2
     }
 
     # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
     # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
-    wandb_id = "1lummxlt" #resume run
+    wandb_id = None #resume run
+    new_model = True
+    clear_redis = True
     wandb.login(key=pickleData["WANDB_KEY"])
-    logger = wandb.init(name = name, project="Variant", entity=pickleData["ENTITY"], id=wandb_id, config=config, resume=wandb_id is not None)
+    logger = wandb.init(name = name + "V3", project="Variant", entity=pickleData["ENTITY"], id=wandb_id, config=config, resume=wandb_id is not None)
     print("Wandb init")
 
     # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
@@ -76,7 +82,7 @@ if __name__ == "__main__":
     rollout_gen = RedisRolloutGenerator(redis, ExpandAdvancedObs, rewards, DiscreteAction,
                                         logger=logger,
                                         save_every=config["iterations_per_save"],
-                                        clear=wandb_id is None)
+                                        clear=new_model or clear_redis)
     print("Rollout init")
 
     # ROCKET-LEARN EXPECTS A SET OF DISTRIBUTIONS FOR EACH ACTION FROM THE NETWORK, NOT
@@ -122,18 +128,22 @@ if __name__ == "__main__":
         epochs=config["epochs"],
         gamma=config["gamma"],
         clip_range=config["clip_range"],
-        vf_coef=1,
+        vf_coef=config["vf_coef"],
         max_grad_norm=0.5,
         logger=logger,
         device="cuda"
     )
-    if wandb_id is not None:
-        checkpint_path = save_dir + "/**.pt"
-        files = glob.glob(checkpint_path, recursive=True)
-        newest_model = max(files, key=os.path.getctime)[0:-4]
-        alg.load(newest_model)
-        alg.agent.optimizer.param_groups[0]["lr"] = config["actor_lr"]
-        alg.agent.optimizer.param_groups[1]["lr"] = config["critic_lr"]
+    if not new_model:
+        try:
+            checkpoint_path = save_dir + "/**/*.pt"
+            files = glob.glob(checkpoint_path, recursive=True)
+            newest_model = max(files, key=os.path.getctime)
+            alg.load(newest_model)
+            alg.agent.optimizer.param_groups[0]["lr"] = config["actor_lr"]
+            alg.agent.optimizer.param_groups[1]["lr"] = config["critic_lr"]
+            redis.set("num-updates", alg.starting_iteration)
+        except:
+            print("Load PPO Checkpoint Failed")
     print("PPO init")
     # BEGIN TRAINING. IT WILL CONTINUE UNTIL MANUALLY STOPPED
     # -iterations_per_save SPECIFIES HOW OFTEN CHECKPOINTS ARE SAVED

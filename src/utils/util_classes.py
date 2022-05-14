@@ -14,7 +14,7 @@ from rlgym.utils.reward_functions.common_rewards.player_ball_rewards import *
 from rlgym.utils.reward_functions.common_rewards.ball_goal_rewards import *
 from rlgym.utils.reward_functions.common_rewards.conditional_rewards import *
 from rlgym.utils.reward_functions import CombinedReward
-from typing import List
+from typing import List, Tuple, Optional, Any
 
 parent_directory = str(pathlib.Path(__file__).parent.parent.resolve())
 sys.path.append(parent_directory)
@@ -353,19 +353,99 @@ class JumpTouchReward(RewardFunction):
 
         return 0
 
+class RLCombinedLogReward(CombinedReward):
 
+    def __init__(
+            self,
+            redis: Any,
+            logger: Any,
+            reward_names: List[str],
+            reward_functions: Tuple[RewardFunction, ...],
+            reward_weights: Optional[Tuple[float, ...]] = None,
+            name_prefix: str = "",
+            repeated_calls: int = 1,
+            relative_count: bool = True
+    ):
+        """
+        Creates the combined reward using multiple rewards, and a potential set
+        of weights for each reward. Will also log the weighted rewards to
+        the WandB logger.
+        :param redis: The redis instance
+        :param logger: WandB logger
+        :param reward_names: The list of reward names
+        :param reward_functions: Each individual reward function.
+        :param reward_weights: The weights for each reward.
+        """
+        super().__init__(reward_functions, reward_weights)
 
-attackRewards = CombinedReward(
+        self.redis = redis
+        self.reward_names = reward_names
+        self.logger = logger
+
+        # Initiates the array that will store the episode totals
+        self.returns = [0] * len(self.reward_functions)
+        self.rewards_given = 0
+        self.name_prefix = name_prefix
+        self.upd_num = 0
+        self.repeated_calls = repeated_calls
+        self.relative_count = relative_count
+
+    def reset(self, initial_state: GameState):
+        self.returns = [0] * len(self.reward_functions)
+        self.rewards_given = 0
+        super().reset(initial_state)
+
+    def get_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        rewards = [
+            func.get_reward(player, state, previous_action)
+            for func in self.reward_functions
+        ]
+
+        for n, value in enumerate(rewards):
+            self.returns[n] += value * self.reward_weights[n] # store the rewards
+        self.rewards_given += 1
+
+        return float(np.dot(self.reward_weights, rewards))
+
+    def get_final_reward(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> float:
+        rewards = [
+            func.get_final_reward(player, state, previous_action)
+            for func in self.reward_functions
+        ]
+
+        for n, value in enumerate(rewards):
+            self.returns[n] += value * self.reward_weights[n] # store the rewards
+        reward_dict = dict()
+        for n, name in enumerate(self.reward_names):
+            reward_dict[self.name_prefix + "_" + name] = self.returns[n]
+            reward_dict[self.name_prefix + "_" + name + "_avg"] = self.returns[n] / self.rewards_given
+        reward_dict[self.name_prefix + "_count"] = self.rewards_given
+        if self.upd_num % self.repeated_calls == 0:
+            #for some reason it is called 6 times per run
+            if self.relative_count:
+                self.logger.log(reward_dict, step=int(self.upd_num/self.repeated_calls), commit=False)
+            else:
+                self.logger.log(reward_dict, step=int(self.redis.get("num-updates")), commit=False)
+            print("Rewards given:", self.rewards_given)
+            print("Update number:", self.upd_num)
+            print(self.returns)
+            print(reward_dict)
+        self.upd_num += 1
+        return float(np.dot(self.reward_weights, rewards))
+
+attackRewards = [
+    ["AlignGoalOff", "BallToGoalDis", "BallToGoalVel", 'DisToBall', "Vel"],
     (
-        VelocityPlayerToBallReward(),
-        LiuDistancePlayerToBallReward(),
+        RewardIfClosestToBall(AlignBallGoal(0,1), True),
         RewardIfTouchedLast(LiuDistanceBallToGoalReward()),
         RewardIfTouchedLast(VelocityBallToGoalReward()),
-        RewardIfClosestToBall(AlignBallGoal(0,1), True),
+        LiuDistancePlayerToBallReward(),
+        VelocityPlayerToBallReward(),
     ),
-    (2.0, 0.2, 1.0, 1.0, 0.8))
+    (0.00014702504, 0.05220883534, 1.00000000000, 0.00001697613, 0.00145454545)]
 
-defendRewards = CombinedReward(
+defendRewards =[
+    ["Vel", 'DisToBall', "BallToGoalDis", "BallToGoalVel", "AlignGoalDef"],
     (
         VelocityPlayerToBallReward(),
         LiuDistancePlayerToBallReward(),
@@ -373,18 +453,20 @@ defendRewards = CombinedReward(
         RewardIfTouchedLast(VelocityBallToGoalReward()),
         AlignBallGoal(1,0)
     ),
-    (1.0, 0.2, 1.0, 1.0, 1.5))
+    (1.0, 0.2, 1.0, 1.0, 1.5)]
 
-lastManRewards = CombinedReward(
+lastManRewards = [
+    ["BallToGoalVel", "AlignGoalDef", "DisToGoal", 'Constant'],
     (
         RewardIfTouchedLast(VelocityBallToGoalReward()),
         AlignBallGoal(1,0),
         LiuDistancePlayerToGoalReward(),
         ConstantReward()
     ),
-    (2.0, 1.0, 0.6, 0.2))
+    (2.0, 1.0, 0.6, 0.2)]
 
-kickoffRewards = CombinedReward(
+kickoffRewards = [
+    ["Combination", "Def", "Lastman", "Spacing", "PickupBoost"],
     (
         RewardIfClosestToBall(
             CombinedReward(
@@ -404,7 +486,7 @@ kickoffRewards = CombinedReward(
         TeamSpacingReward(),
         pickupBoost()
     ),
-    (2.0, 1.0, 1.5, 1.0, 0.4))
+    (0.15, 52.21, 1000.00, 0.02, 1.45)]
 
 def get_base_match(team_size):
     return Match(
@@ -418,61 +500,141 @@ def get_base_match(team_size):
         state_setter = RandomState()  # Resets to random
     )
 
-def get_match(team_size):
+def get_match(team_size, redis=None, wandb=None):
     match: Match = get_base_match(team_size)
-    match._reward_fn = CombinedReward(
-        (
-            RewardIfAttacking(attackRewards),
-            RewardIfDefending(defendRewards),
-            RewardIfLastMan(lastManRewards),
-            VelocityReward(),
-            FaceBallReward(),
-            EventReward(
-                team_goal=100.0,
-                goal=10.0 * team_size,
-                concede=-100.0 + (10.0 * team_size),
-                shot=10.0,
-                save=30.0,
-                demo=12.0,
+    if redis != None and wandb != None: 
+        match._reward_fn = RLCombinedLogReward(
+            redis, wandb,
+            [
+                "Att",
+                "Event",
+                #"Flip",
+                "Jumptouch",
+                "MatchFaceball",
+                #"Pickupboost",
+                #"Saveboost",
+                #"Spacing",
+                "Touch",
+                #"Useboost",
+                "Vel"
+            ],
+            (
+                RLCombinedLogReward(redis, wandb, attackRewards[0], attackRewards[1], attackRewards[2], "Att", 6), #RewardIfAttacking()
+                EventReward(
+                    team_goal=100.0,
+                    goal=10.0 * team_size,
+                    concede=-100.0 + (10.0 * team_size),
+                    shot=10.0,
+                    save=30.0,
+                    demo=12.0,
+                ),
+                #FlipReward(),
+                JumpTouchReward(),
+                FaceBallReward(),
+                #pickupBoost(),
+                #SaveBoostReward(),
+                #TeamSpacingReward(1500),
+                TouchBallReward(1.2),
+                #useBoost(),
+                VelocityReward()
             ),
-            JumpTouchReward(),
-            TouchBallReward(1.2),
-            TeamSpacingReward(1500),
-            FlipReward(),
-            SaveBoostReward(),
-            pickupBoost(),
-            useBoost()
-        ),
-        #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
-        (0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.01, 0.35, 1.06, 71.35))
+            #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
+            #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.01, 0.35, 1.06, 71.35)) V0-57
+            #(0.08, 20.41, 0.03, 380.38, 0.55, 0.77, 0.32, 0.37, 70.12, 50.45, 0.14),
+            (
+                0.00010157155,
+                0.00308826355,
+                #0.00000099052,
+                0.03008629028,
+                0.00029356597,
+                #0.00005005627,
+                #0.00002602214,
+                #0.00005849864,
+                0.00469220744,
+                #0.00348264214,
+                0.00002059851
+
+            ), "Match", 6)
+    else:
+        match._reward_fn = CombinedReward(
+            (
+                CombinedReward(attackRewards[1], attackRewards[2]), #RewardIfAttacking()
+                EventReward(
+                    team_goal=100.0,
+                    goal=10.0 * team_size,
+                    concede=-100.0 + (10.0 * team_size),
+                    shot=10.0,
+                    save=30.0,
+                    demo=12.0,
+                ),
+                FlipReward(),
+                JumpTouchReward(),
+                FaceBallReward(),
+                pickupBoost(),
+                SaveBoostReward(),
+                TeamSpacingReward(1500),
+                TouchBallReward(1.2),
+                useBoost(),
+                VelocityReward()
+            ),
+            #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
+            #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.01, 0.35, 1.06, 71.35)) V0-57
+            (0.20, 15.0, 0.0, 10.0, 0.1, 0.2, 1.0, 0.2, 4.0, 2.0, 0.2))
     match._terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()]
     match._state_setter = RandomState()  # Resets to random
     return match
 
-def get_kickoff(team_size):
+def get_kickoff(team_size, redis=None, wandb=None):
     match: Match = get_base_match(team_size)
-    match._reward_fn = CombinedReward(
-        (
-            kickoffRewards,
-            VelocityReward(),
-            FaceBallReward(),
-            EventReward(
-                team_goal=100.0,
-                goal=10.0 * team_size,
-                concede=-100.0 + (10.0 * team_size),
-                shot=10.0,
-                save=30.0,
-                demo=12.0,
+    if redis != None and wandb != None: 
+        match._reward_fn = RLCombinedLogReward(
+            redis, wandb,
+            ["Kickoff", "Vel", 'KickFaceball', "Event", "Jumptouch", "Touch", "Spacing", "Flip", "Saveboost", "Pickupboost", "Useboost"],
+            (
+                RLCombinedLogReward(redis, wandb, kickoffRewards[0], kickoffRewards[1], kickoffRewards[2], "KO"),
+                VelocityReward(),
+                FaceBallReward(),
+                EventReward(
+                    team_goal=100.0,
+                    goal=10.0 * team_size,
+                    concede=-100.0 + (10.0 * team_size),
+                    shot=10.0,
+                    save=30.0,
+                    demo=12.0,
+                ),
+                JumpTouchReward(),
+                TouchBallReward(1.2),
+                TeamSpacingReward(1500),
+                FlipReward(),
+                SaveBoostReward(),
+                pickupBoost(),
+                useBoost(),
             ),
-            JumpTouchReward(),
-            TouchBallReward(1.2),
-            TeamSpacingReward(1500),
-            FlipReward(),
-            SaveBoostReward(),
-            pickupBoost(),
-            useBoost(),
-        ),
-        (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16))
+            (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16),
+            "Kick")
+    else:
+        match._reward_fn = CombinedReward(
+            (
+                CombinedReward(kickoffRewards[1], kickoffRewards[2]),
+                VelocityReward(),
+                FaceBallReward(),
+                EventReward(
+                    team_goal=100.0,
+                    goal=10.0 * team_size,
+                    concede=-100.0 + (10.0 * team_size),
+                    shot=10.0,
+                    save=30.0,
+                    demo=12.0,
+                ),
+                JumpTouchReward(),
+                TouchBallReward(1.2),
+                TeamSpacingReward(1500),
+                FlipReward(),
+                SaveBoostReward(),
+                pickupBoost(),
+                useBoost(),
+            ),
+            (0.08, 0.52, 0.82, 27.56, 108.22, 41.05, 0.2, 0.1, 1.0, 3.81, 319.16))
     match._terminal_conditions = [TimeoutCondition(2000), GoalScoredCondition()]
     match._state_setter = ModifiedState()  # Resets to kickoff position
     return match

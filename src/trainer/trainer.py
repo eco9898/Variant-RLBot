@@ -273,13 +273,13 @@ if __name__ == "__main__":
     #Clear worker logs
     shutil.rmtree(data_location + "worker-logs", ignore_errors=True)
     print(">Cleared worker logs")
+    initial_instances = getRLInstances()
     try:
         messages: Dict[str, multiprocessing.Queue] = {}
         monitors: Dict[str, multiprocessing.Process] = {}
         model_instances: Dict[str, List[int]]  = {}
         models_used: Dict[str, List]  = {}
         all_instances = []
-        initial_instances = getRLInstances()
         #no try and catch is needed during startup as the starters will clean themselves up
         #RLGym can't have reopened a RL instance yet
         for model_args in models:
@@ -315,12 +315,11 @@ if __name__ == "__main__":
                 while monitor.is_alive():
                     sleep(0.1)
                 messages[key].close()
-                #kill instances reported
-                #killRL(all_instances)
-                #Kill instances that weren't present before
-                killRL(blacklist=initial_instances)
     except:
-        pass
-    finally:
-        #kill redis
-        r.shutdown()
+        print(">Exiting")
+    #kill instances reported
+    #killRL(all_instances)
+    #Kill instances that weren't present before
+    killRL(blacklist=initial_instances)
+    #kill redis
+    r.shutdown()
