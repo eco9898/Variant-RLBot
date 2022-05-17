@@ -51,11 +51,11 @@ if __name__ == "__main__":
 
     # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
     # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
-    wandb_id = None #resume run
-    new_model = True
-    clear_redis = True
+    wandb_id = "3uxwel4d" #resume run
+    new_model = False
+    clear_redis = False
     wandb.login(key=pickleData["WANDB_KEY"])
-    logger = wandb.init(name = name + "V3", project="Variant", entity=pickleData["ENTITY"], id=wandb_id, config=config, resume=wandb_id is not None)
+    logger = wandb.init(name = name + "V4", project="Variant", entity=pickleData["ENTITY"], id=wandb_id, config=config, resume=wandb_id is not None)
     print("Wandb init")
 
     # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
@@ -142,6 +142,7 @@ if __name__ == "__main__":
             alg.agent.optimizer.param_groups[0]["lr"] = config["actor_lr"]
             alg.agent.optimizer.param_groups[1]["lr"] = config["critic_lr"]
             redis.set("num-updates", alg.starting_iteration)
+            redis.set("model-version", -alg.starting_iteration)
         except:
             print("Load PPO Checkpoint Failed")
     print("PPO init")

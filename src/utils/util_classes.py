@@ -434,15 +434,27 @@ class RLCombinedLogReward(CombinedReward):
         return float(np.dot(self.reward_weights, rewards))
 
 attackRewards = [
-    ["AlignGoalOff", "BallToGoalDis", "BallToGoalVel", 'DisToBall', "Vel"],
+    [
+        "AlignGoalOff",
+    #"BallToGoalDis",
+    #"BallToGoalVel",
+    #'DisToBall',
+    "Vel"
+    
+    ],
     (
-        RewardIfClosestToBall(AlignBallGoal(0,1), True),
-        RewardIfTouchedLast(LiuDistanceBallToGoalReward()),
-        RewardIfTouchedLast(VelocityBallToGoalReward()),
-        LiuDistancePlayerToBallReward(),
+        #RewardIfClosestToBall(
+        AlignBallGoal(0,1),# True),
+        #RewardIfTouchedLast(LiuDistanceBallToGoalReward()),
+        #RewardIfTouchedLast(VelocityBallToGoalReward()),
+        #LiuDistancePlayerToBallReward(),
         VelocityPlayerToBallReward(),
     ),
-    (0.00014702504, 0.05220883534, 1.00000000000, 0.00001697613, 0.00145454545)]
+    (0.00014702504,
+   # 0.05220883534,
+    #1.00000000000,
+    #0.00001697613,
+    0.00145454545)]
 
 defendRewards =[
     ["Vel", 'DisToBall', "BallToGoalDis", "BallToGoalVel", "AlignGoalDef"],
@@ -528,8 +540,8 @@ def get_match(team_size, redis=None, wandb=None):
                     save=30.0,
                     demo=12.0,
                 ),
-                #FlipReward(),
-                JumpTouchReward(),
+                FlipReward(),
+                #JumpTouchReward(),
                 FaceBallReward(),
                 #pickupBoost(),
                 #SaveBoostReward(),
@@ -544,15 +556,15 @@ def get_match(team_size, redis=None, wandb=None):
             (
                 0.00010157155,
                 0.00308826355,
-                #0.00000099052,
-                0.03008629028,
+                -0.00020099052,
+                #0.03008629028,
                 0.00029356597,
                 #0.00005005627,
                 #0.00002602214,
                 #0.00005849864,
                 0.00469220744,
                 #0.00348264214,
-                0.00002059851
+                0.00004059851
 
             ), "Match", 6)
     else:
@@ -580,7 +592,7 @@ def get_match(team_size, redis=None, wandb=None):
             #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.22, 0.35, 1.06, 71.35))
             #(0.14, 0.25, 0.32, 0.19, 0.13, 3.33, 16.66, 4.36, 0.23, 0.01, 0.35, 1.06, 71.35)) V0-57
             (0.20, 15.0, 0.0, 10.0, 0.1, 0.2, 1.0, 0.2, 4.0, 2.0, 0.2))
-    match._terminal_conditions = [NoTouchTimeoutCondition(20000), GoalScoredCondition()]
+    match._terminal_conditions = [NoTouchTimeoutCondition(2000), GoalScoredCondition()]
     match._state_setter = RandomState()  # Resets to random
     return match
 
